@@ -1,0 +1,47 @@
+dataset: meta-omniglot
+data_root: "C:/Users/aligunduz/PycharmProjects/PyTorch-MAML/data/omniglot/"
+train:
+  split: meta-train
+  image_size: 84
+  normalization: False
+  transform: null
+  n_batch: 200
+  n_episode: 4
+  n_way: 5
+  n_shot: 5
+  n_query: 15
+val:
+  split: meta-val
+  image_size: 84
+  normalization: False
+  transform: null
+  n_batch: 200
+  n_episode: 6
+  n_way: 5
+  n_shot: 5
+  n_query: 15
+
+encoder: convnet4
+encoder_args:
+  bn_args:
+    track_running_stats: False
+classifier: logistic
+
+inner_args:
+  n_step: 5
+  encoder_lr: 0.01
+  classifier_lr: 0.01
+  first_order: False
+  frozen:
+    - bn
+
+optimizer: adam
+optimizer_args:
+  lr: 0.001
+log_alignment: true
+use_alignment_pre_loss: false
+use_alignment_post_loss: false
+alignment_pre_weight: 0.1
+alignment_post_weight: 0.1
+use_gradient_transport: false
+epoch: 100

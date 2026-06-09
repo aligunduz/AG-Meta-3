@@ -1,0 +1,11 @@
+.venv/
+.idea/
+__pycache__/
+*.pyc
+
+data/
+materials/
+save/
+runs/
+wandb/
+*.log
