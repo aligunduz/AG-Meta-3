@@ -303,22 +303,29 @@ class MAML(Module):
 
     return routing_weights, support_losses.detach()
 
-  def _mix_anchor_params(self, routing_weights, inner_args):
+  def _mix_anchor_params(self, routing_weights, inner_args, meta_train):
     base_params = self._base_named_parameters()
     params = OrderedDict()
-    for name in self.multi_anchor_param_names:
-      if not self._is_adaptable_param(name, base_params[name], inner_args):
-        continue
+    with torch.enable_grad():
+      for name in self.multi_anchor_param_names:
+        if not self._is_adaptable_param(name, base_params[name], inner_args):
+          continue
 
-      mixed_param = None
-      for anchor_idx, weight in enumerate(routing_weights):
-        anchor_param = self.multi_anchor_bank[anchor_idx].get_param(name)
-        weighted_param = weight * anchor_param
-        if mixed_param is None:
-          mixed_param = weighted_param
+        mixed_param = None
+        for anchor_idx, weight in enumerate(routing_weights):
+          anchor_param = self.multi_anchor_bank[anchor_idx].get_param(name)
+          weighted_param = weight * anchor_param
+          if mixed_param is None:
+            mixed_param = weighted_param
+          else:
+            mixed_param = mixed_param + weighted_param
+
+        if meta_train:
+          if not mixed_param.requires_grad:
+            mixed_param = mixed_param.clone().requires_grad_(True)
         else:
-          mixed_param = mixed_param + weighted_param
-      params[name] = mixed_param
+          mixed_param = mixed_param.detach().requires_grad_(True)
+        params[name] = mixed_param
     return params
 
   def _routing_stats(self, routing_weights, support_losses):
@@ -584,7 +591,8 @@ class MAML(Module):
       if self.use_multi_anchor:
         routing_weights, support_losses = self._compute_anchor_routing(
           x_shot[ep], y_shot[ep], ep, inner_args, meta_train)
-        params = self._mix_anchor_params(routing_weights, inner_args)
+        params = self._mix_anchor_params(
+          routing_weights, inner_args, meta_train)
         multi_anchor_stats.append(
           self._routing_stats(routing_weights, support_losses))
       else:
