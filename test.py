@@ -118,6 +118,16 @@ def make_test_run_name(config, ckpt_config):
     dataset.replace('meta-', ''), n_way, n_shot, ckpt_name)
 
 
+def resolve_multi_anchor_config(config, ckpt):
+  ckpt_config = ckpt.get('config') or {}
+  use_multi_anchor = config.get(
+    'use_multi_anchor',
+    ckpt_config.get('use_multi_anchor', 'multi_anchor_state_dict' in ckpt))
+  multi_anchor_args = dict(ckpt_config.get('multi_anchor') or {})
+  multi_anchor_args.update(config.get('multi_anchor') or {})
+  return bool(use_multi_anchor), multi_anchor_args
+
+
 def main(config):
   random.seed(0)
   np.random.seed(0)
@@ -142,7 +152,13 @@ def main(config):
   use_gradient_transport = config.get(
     'use_gradient_transport',
     ckpt_config.get('use_gradient_transport', False))
-  model = models.load(ckpt, load_clf=(not inner_args['reset_classifier']))
+  use_multi_anchor, multi_anchor_args = resolve_multi_anchor_config(
+    config, ckpt)
+  model = models.load(
+    ckpt,
+    load_clf=(not inner_args['reset_classifier']),
+    use_multi_anchor=use_multi_anchor,
+    multi_anchor_args=multi_anchor_args)
   ckpt_training = ckpt.get('training', {})
 
   if args.efficient:
@@ -154,6 +170,10 @@ def main(config):
   utils.log('num params: {}'.format(utils.compute_n_params(model)))
   utils.log('gradient transport: {}'.format(
     'enabled' if use_gradient_transport else 'disabled'))
+  utils.log('multi-anchor: {}'.format(
+    'enabled' if use_multi_anchor else 'disabled'))
+  if use_multi_anchor:
+    utils.log('multi-anchor args: {}'.format(multi_anchor_args))
   if 'epoch' in ckpt_training:
     wandb_logger.set_summary('checkpoint/epoch', ckpt_training['epoch'])
   if 'max_va' in ckpt_training:
@@ -161,6 +181,8 @@ def main(config):
       'checkpoint/max_val_accuracy', ckpt_training['max_va'])
   wandb_logger.set_summary(
     'gradient_transport/enabled', int(bool(use_gradient_transport)))
+  wandb_logger.set_summary(
+    'multi_anchor/enabled', int(bool(use_multi_anchor)))
   if use_gradient_transport:
     if 'gradient_transport_state_dict' not in ckpt:
       utils.log(
@@ -232,6 +254,7 @@ def main(config):
       'test/n_episode': config['test']['n_episode'],
       'test/n_batch': config['test'].get('n_batch'),
       'gradient_transport/enabled': int(bool(use_gradient_transport)),
+      'multi_anchor/enabled': int(bool(use_multi_anchor)),
     }, step=epoch)
 
   final_ci95 = float(utils.mean_confidence_interval(va_lst))

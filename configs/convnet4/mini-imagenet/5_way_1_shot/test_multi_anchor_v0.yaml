@@ -1,0 +1,36 @@
+dataset: meta-mini-imagenet
+data_root: "C:/Users/aligunduz/PycharmProjects/PyTorch-MAML/data/miniImageNet/"
+test:
+  split: meta-test
+  image_size: 84
+  normalization: False
+  transform: null
+  n_batch: 150
+  n_episode: 4
+  n_way: 5
+  n_shot: 1
+  n_query: 1
+
+load: ./save/convnet4_mini-imagenet_5_way_1_shot_multi_anchor_v0/max-va.pth
+
+inner_args:
+  n_step: 10
+  encoder_lr: 0.01
+  classifier_lr: 0.01
+  first_order: False  # set to True for FOMAML
+  frozen:
+    - bn
+
+use_gradient_transport: false
+use_multi_anchor: true
+multi_anchor:
+  n_anchor: 3
+  tau: 1.0
+  detach_routing_weights: true
+  init_noise_std: 0.01
+  log_stats: true
+  log_anchor_diagnostics: true
+  anchor_log_interval: 20
+  save_anchor_snapshots: true
+  snapshot_interval: 20
+epoch: 10

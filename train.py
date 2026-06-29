@@ -1,4 +1,5 @@
 import argparse
+import csv
 import os
 import random
 
@@ -105,6 +106,20 @@ class WandbLogger(object):
     if self.enabled:
       self._wandb.log(metrics, step=step)
 
+  def log_anchor_pca(self, rows, step=None):
+    if not self.enabled:
+      return
+    table = self._wandb.Table(
+      columns=['epoch', 'anchor', 'pc1', 'pc2'],
+      data=rows)
+    payload = {'multi_anchor/anchor_space_pca_table': table}
+    try:
+      payload['multi_anchor/anchor_space_pca'] = self._wandb.plot.scatter(
+        table, 'pc1', 'pc2', title='Anchor PCA')
+    except Exception:
+      pass
+    self._wandb.log(payload, step=step)
+
   def set_summary(self, key, value):
     if self.enabled and self.run is not None:
       self.run.summary[key] = value
@@ -141,9 +156,99 @@ def make_ckpt_name(config, args):
     ckpt_name += '_' + config['dataset'].replace('meta-', '')
     ckpt_name += '_{}_way_{}_shot'.format(
       config['train']['n_way'], config['train']['n_shot'])
+    if config.get('use_multi_anchor', False):
+      ckpt_name += '_multi_anchor_v0'
   if args.tag is not None:
     ckpt_name += '_' + args.tag
   return ckpt_name
+
+
+def resolve_multi_anchor_config(config, ckpt=None):
+  ckpt_config = {}
+  ckpt_has_anchors = False
+  if ckpt is not None:
+    ckpt_config = ckpt.get('config') or {}
+    ckpt_has_anchors = 'multi_anchor_state_dict' in ckpt
+
+  use_multi_anchor = config.get(
+    'use_multi_anchor',
+    ckpt_config.get('use_multi_anchor', ckpt_has_anchors))
+  multi_anchor_args = dict(ckpt_config.get('multi_anchor') or {})
+  multi_anchor_args.update(config.get('multi_anchor') or {})
+  return bool(use_multi_anchor), multi_anchor_args
+
+
+def make_optimizer_from_checkpoint_training(ckpt, model):
+  train_state = ckpt['training']
+  return optimizers.make(
+    train_state['optimizer'],
+    model.parameters(),
+    **train_state['optimizer_args'])
+
+
+def write_anchor_pca_csv(snapshot_dir, epoch, diagnostics):
+  os.makedirs(snapshot_dir, exist_ok=True)
+  path = os.path.join(
+    snapshot_dir, 'anchor_pca_epoch_{:03d}.csv'.format(epoch))
+  with open(path, 'w', newline='') as f:
+    writer = csv.writer(f)
+    writer.writerow([
+      'epoch', 'anchor', 'pc1', 'pc2',
+      'norm', 'delta_from_init_norm'])
+    for anchor_idx, coords in enumerate(diagnostics['pca_coords']):
+      writer.writerow([
+        epoch,
+        anchor_idx,
+        coords[0],
+        coords[1],
+        diagnostics['anchor_norms'][anchor_idx],
+        diagnostics['anchor_delta_from_init_norms'][anchor_idx],
+      ])
+  return path
+
+
+def maybe_log_multi_anchor_diagnostics(
+        model,
+        writer,
+        wandb_logger,
+        ckpt_path,
+        epoch):
+  if not getattr(model, 'use_multi_anchor', False):
+    return {}
+
+  multi_anchor_args = model.multi_anchor_args
+  log_diagnostics = bool(multi_anchor_args.get('log_anchor_diagnostics', True))
+  save_snapshots = bool(multi_anchor_args.get('save_anchor_snapshots', True))
+  log_interval = int(multi_anchor_args.get('anchor_log_interval', 20))
+  snapshot_interval = int(multi_anchor_args.get('snapshot_interval', 20))
+  should_log = log_diagnostics and epoch % log_interval == 0
+  should_snapshot = save_snapshots and epoch % snapshot_interval == 0
+  if not should_log and not should_snapshot:
+    return {}
+
+  diagnostics = model.get_multi_anchor_diagnostics()
+  metrics = diagnostics['metrics']
+  if should_log:
+    for key, value in metrics.items():
+      writer.add_scalar(key, value, epoch)
+    rows = [
+      [epoch, anchor_idx, coords[0], coords[1]]
+      for anchor_idx, coords in enumerate(diagnostics['pca_coords'])
+    ]
+    wandb_logger.log_anchor_pca(rows, step=epoch)
+
+  snapshot_dir = os.path.join(ckpt_path, 'anchor_snapshots')
+  if should_log or should_snapshot:
+    write_anchor_pca_csv(snapshot_dir, epoch, diagnostics)
+
+  if should_snapshot:
+    os.makedirs(snapshot_dir, exist_ok=True)
+    model.save_multi_anchor_snapshot(
+      os.path.join(snapshot_dir, 'epoch_{:03d}.pt'.format(epoch)),
+      epoch,
+      diagnostics)
+
+  return metrics if should_log else {}
 
 
 def main(config):
@@ -165,6 +270,7 @@ def main(config):
   yaml.dump(config, open(os.path.join(ckpt_path, 'config.yaml'), 'w'))
   wandb_logger = WandbLogger(config, args, ckpt_name, ckpt_path)
   use_gradient_transport = config.get('use_gradient_transport', False)
+  use_multi_anchor, multi_anchor_args = resolve_multi_anchor_config(config)
 
   train_set = datasets.make(config['dataset'], **config['train'])
   utils.log('meta-train set: {} (x{}), {}'.format(
@@ -188,21 +294,42 @@ def main(config):
   inner_args = utils.config_inner_args(config.get('inner_args'))
   if config.get('load'):
     ckpt = torch.load(config['load'])
+    use_multi_anchor, multi_anchor_args = resolve_multi_anchor_config(
+      config, ckpt)
+    config['use_multi_anchor'] = use_multi_anchor
+    if use_multi_anchor:
+      config['multi_anchor'] = multi_anchor_args
     config['encoder'] = ckpt['encoder']
     config['encoder_args'] = ckpt['encoder_args']
     config['classifier'] = ckpt['classifier']
     config['classifier_args'] = ckpt['classifier_args']
-    model = models.load(ckpt, load_clf=(not inner_args['reset_classifier']))
-    optimizer, lr_scheduler = optimizers.load(ckpt, model.parameters())
+    model = models.load(
+      ckpt,
+      load_clf=(not inner_args['reset_classifier']),
+      use_multi_anchor=use_multi_anchor,
+      multi_anchor_args=multi_anchor_args)
+    try:
+      optimizer, lr_scheduler = optimizers.load(ckpt, model.parameters())
+    except ValueError as exc:
+      utils.log(
+        'warning: optimizer state is incompatible with current model; '
+        'creating a fresh optimizer ({})'.format(exc))
+      optimizer, lr_scheduler = make_optimizer_from_checkpoint_training(
+        ckpt, model)
     start_epoch = ckpt['training']['epoch'] + 1
     max_va = ckpt['training']['max_va']
   else:
+    config['use_multi_anchor'] = use_multi_anchor
+    if use_multi_anchor:
+      config['multi_anchor'] = multi_anchor_args
     config['encoder_args'] = config.get('encoder_args') or dict()
     config['classifier_args'] = config.get('classifier_args') or dict()
     config['encoder_args']['bn_args']['n_episode'] = config['train']['n_episode']
     config['classifier_args']['n_way'] = config['train']['n_way']
     model = models.make(config['encoder'], config['encoder_args'],
-                        config['classifier'], config['classifier_args'])
+                        config['classifier'], config['classifier_args'],
+                        use_multi_anchor=use_multi_anchor,
+                        multi_anchor_args=multi_anchor_args)
     optimizer, lr_scheduler = optimizers.make(
       config['optimizer'], model.parameters(), **config['optimizer_args'])
     start_epoch = 1
@@ -217,6 +344,10 @@ def main(config):
   utils.log('num params: {}'.format(utils.compute_n_params(model)))
   utils.log('gradient transport: {}'.format(
     'enabled' if use_gradient_transport else 'disabled'))
+  utils.log('multi-anchor: {}'.format(
+    'enabled' if use_multi_anchor else 'disabled'))
+  if use_multi_anchor:
+    utils.log('multi-anchor args: {}'.format(multi_anchor_args))
   wandb_logger.watch(model, config)
   timer_elapsed, timer_epoch = utils.Timer(), utils.Timer()
   scaler = amp.GradScaler('cuda')
@@ -227,6 +358,7 @@ def main(config):
   for epoch in range(start_epoch, config['epoch'] + 1):
     timer_epoch.start()
     aves = {k: utils.AverageMeter() for k in aves_keys}
+    multi_anchor_meters = {}
 
     model.train()
     writer.add_scalar('lr', optimizer.param_groups[0]['lr'], epoch)
@@ -260,6 +392,13 @@ def main(config):
         pred = torch.argmax(logits, dim=-1)
         acc = utils.compute_acc(pred, labels)
         loss = F.cross_entropy(logits, labels)
+
+      if use_multi_anchor and multi_anchor_args.get('log_stats', True):
+        model_for_stats = model.module if config.get('_parallel') else model
+        for key, value in model_for_stats.get_last_multi_anchor_stats().items():
+          if key not in multi_anchor_meters:
+            multi_anchor_meters[key] = utils.AverageMeter()
+          multi_anchor_meters[key].update(value, 1)
 
       scaler.scale(loss).backward()
       scaler.unscale_(optimizer)
@@ -330,6 +469,17 @@ def main(config):
         writer.add_scalar(f'gradient_transport/{gate_name}', gate_value, epoch)
         wandb_metrics[f'gradient_transport/{gate_name}'] = gate_value
 
+    if use_multi_anchor and multi_anchor_args.get('log_stats', True):
+      for key, meter in multi_anchor_meters.items():
+        value = meter.item()
+        writer.add_scalar(key, value, epoch)
+        wandb_metrics[key] = value
+
+    model_for_log = model.module if config.get('_parallel') else model
+    if use_multi_anchor:
+      wandb_metrics.update(maybe_log_multi_anchor_diagnostics(
+        model_for_log, writer, wandb_logger, ckpt_path, epoch))
+
     epoch_seconds = timer_epoch.end()
     elapsed_seconds = timer_elapsed.end()
     estimate_seconds = (
@@ -381,8 +531,12 @@ def main(config):
       'classifier_state_dict': model_.classifier.state_dict(),
       'gradient_transport_state_dict':
         model_.gradient_transport_logits.state_dict(),
+      'use_multi_anchor': model_.use_multi_anchor,
+      'multi_anchor_args': model_.multi_anchor_args,
       'training': training,
     }
+    if model_.use_multi_anchor:
+      ckpt['multi_anchor_state_dict'] = model_.get_multi_anchor_state_dict()
 
     torch.save(ckpt, os.path.join(ckpt_path, 'epoch-last.pth'))
     torch.save(trlog, os.path.join(ckpt_path, 'trlog.pth'))
